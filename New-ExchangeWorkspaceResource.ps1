@@ -1,581 +1,383 @@
-<# 
+<#
+
+.EXAMPLE
+
+This script was desgined to be launched using a POST API request within the context of a workflow in Freshservice Workflow Automator, however, it can be initiated using any HTTP client.
+
+Define the webhook URL:
+
+$url = "https://4534bh34-345j34d4-dfdfg435a3453.webhook.eus.azure-automation.net/webhooks?token=YdtdhY0RP2dsfsdS4204o5S2f9sERdfsdGMdfnAd%s3DadlxYDCQUBo%3d"
+
+Create the body as a hashtable:
+
+$body = @{
+    location             = "Main Office"
+    floornum            = "4"
+    floorlabel          = "Fourth Floor"
+    capacity            = "1"
+    wheelchairaccessible = "true"
+    officeid            = "345"
+    cubicleid           = ""
+    managers            = "someone@contoso.com,another@contoso.com"
+    permissions         = "Editor (manage existing meetings),Approver"
+    managementscope     = "All reservable resources (new and existing)"
+    ticketid            = "34536"
+    itemrequestid       = "10005161241"
+}
+
+Convert hashtable to JSON:
+
+$jsonBody = $body | ConvertTo-Json -Depth 3
+
+Send the POST request:
+
+$response = Invoke-WebRequest -Uri $url -Method POST -Body $jsonBody -ContentType 'application/json'
+
+Output the response:
+
+$response.Content
+
 .SYNOPSIS
-Ingests webhook information sent from Freshservice Workflow Automator and creates a reservable resource in Microsoft Exchange given information provided.
+    Automates the creation and configuration of reservable workspace resources in Exchange Online.
 
-.DESCRIPTION 
-The script is intended to ingest webhook data sent from a defined Freshservice Workflow in the context of an Azure Runbook. 
-In this case, a worklfow is defined in my Freshservice tenant to trigger when a requestor requests a published service catalog item. 
+.DESCRIPTION
+    This script ingests webhook data from a Freshservice Workflow Automator Workflow API call, and provisions a new room mailbox of type 'Workspace' in 
+    Exchange Online, representing a reservable workspace (e.g., office or cubicle). It configures 
+    location metadata, calendar processing rules, and access permissions based on the request payload.
 
-The workflow subsequently pulls the information provided from the service request form and submits JSON data to a defined Webhook URL 
-associated with the Azure Runbook. Once the webhook data is received, the Azure Runbook will then execute this script and ingest data from
-the webhook data and create an Exchange Workspace Resource.
+    The script uses managed identity to securely authenticate with Azure and Exchange Online, 
+    retrieves credentials from Azure Key Vault, and integrates with the Freshservice API to log 
+    ticket updates and notify stakeholders of success or failure.
 
-.COMPONENT 
-Requires the installation or import of the ExchangeOnlineManagement PowerShell module.
+    Key operations include:
+      - Parsing webhook JSON payloads
+      - Creating Exchange Online room resource mailbox of type 'Workspace' (not available in Exchange Admin Center)
+      - Setting location, capacity, and accessibility metadata
+      - Assigning calendar permissions to managers and admin groups
+      - Logging outcomes and updating Freshservice tickets
 
-.PARAMETER WebhookData
-Webhook data sent to Azure Runbook trigger from Freshservice Workflow Automator.
+.AUTHOR
+    Alex Gonzalez
 
-.PARAMETER AsJson
-Properties of Workspace needing to be created. Allowed properties can be found in the $JsonSchema variable set below.
+.CREATED
+    2024-02-15
 
-.PARAMETER Office
-Office location where a given Workspace resides (e.g., Chicago Office).
+.LAST MODIFIED
+    2025-05-23
 
-.PARAMETER OfficeId
-Unique identifier of an office room in a given remote office (e.g., a2000).
+.VERSION
+    2.0
 
-.PARAMETER CubicleId
-Unique identifier of an office room in a given remote office (e.g., ws1000).
+.REQUIREMENTS
+    - PowerShell 5.1 (7.1+ has existing issues with required modules as Microsoft botched compatiability [expected to be fixed ~2025])
+    - ExchangeOnlineManagement module (any version)
+    - Az.KeyVault module (v4.9.2) - highest version capabling of supporting current Az.Accounts dependency due to shenanigans with Microsoft breaking Azure Automation
+    - Azure Managed Identity enabled with access to Exchange Online (App registration permission: Office 365 Exchange Online role with claim of Exchange.ManageAsApp) and Key Vault (IAM role of 'Key Vault Secret User assigned to Automation Account)
+    - Freshservice API key stored in Azure Key Vault
 
-.PARAMETER FloorNum_Of
-Numerical value of floor number where a given Workspace resides (e.g., 2).
-
-.PARAMETER FloorLabel
-Text value of a floor number where a given Workspace resides (e.g., Second Floor).
-
-.PARAMETER Capacity
-Enforced capacity value for a given Workspace. Restricts organizer from inviting other recipients.
-
-.PARAMETER WheelChairAccessible
-Switch value if a given Workspace is wheelchair accessible.
-
-.PARAMETER Moderators
-Email addresses of moderators needed to approve booking requests using delegation and or granted editor permissions to the resource calendar. 
-
-.PARAMETER CalendarPermissions
-Rights necessary for the moderators (e.g., Editor, Delegate)
-
+.NOTES
+    This script was designed to be used in the context of an Azure Automation runbook as a managed identity. It includes robust error handling and notification logic.
 #>
 
-[CmdletBinding(DefaultParameterSetName = "WebhookTrigger")]
-param (
-    # Parameter for only webhook data
-    [Parameter(ParameterSetName = "WebhookTrigger", Mandatory = $true)]
-    [Object]$WebhookData,
 
-    # Parameter for only webhook data
-    [Parameter(ParameterSetName = "JsonOnly", Mandatory = $true)]
-    [Object]$AsJSON,
-
-    # Parameter set for Office type.
-    [Parameter(ParameterSetName = "OfficeSet", Mandatory = $true)]
-    [Parameter(ParameterSetName = "CubicleSet",Mandatory = $true)]
-    [String]$Office,
-
-    [Parameter(ParameterSetName = "OfficeSet",Mandatory = $true)]
-    [String]$OfficeId,
-
-    [Parameter(ParameterSetName = "CubicleSet",Mandatory = $true)]
-    [String]$CubicleId,
-
-    [Parameter(ParameterSetName = "OfficeSet",Mandatory = $true)]
-    [Parameter(ParameterSetName = "CubicleSet",Mandatory = $true)]
-    [Int]$FloorNum,
-
-    [Parameter(ParameterSetName = "OfficeSet",Mandatory = $true)]
-    [Parameter(ParameterSetName = "CubicleSet",Mandatory = $true)]
-    [String]$FloorLabel,
-
-    [Parameter(ParameterSetName = "OfficeSet",Mandatory = $true)]
-    [Parameter(ParameterSetName = "CubicleSet",Mandatory = $true)]
-    [Int]$Capacity,
-
-    [Parameter(ParameterSetName = "OfficeSet")]
-    [Parameter(ParameterSetName = "CubicleSet")]
-    [Switch]$WheelChairAccessible,
-
-    [Parameter(ParameterSetName = "OfficeSet")]
-    [Parameter(ParameterSetName = "CubicleSet")]
-    [ValidateScript(
-    {
-      if (-not $PSBoundParameters.ContainsKey("CalendarPermissions"))
-      {
-        throw "Moderators requires CalendarPermissions to be provided."
-      }
-      $true
-    })]
-    [Array]$Moderators,
-
-    [Parameter(ParameterSetName = "OfficeSet")]
-    [Parameter(ParameterSetName = "CubicleSet")]
-    [ValidateScript(
-    {
-      if (-not $PSBoundParameters.ContainsKey('Moderators')) 
-      {
-          throw "CalendarPermissions requires Moderators to be provided."
-      }
-        $true
-      })]
-    [Array]$CalendarPermissions
-    )
-
-# Import Exchange PowerShell module to session.
-Import-Module ExchangeOnlineManagement
-
-# [REQUIRED] Set organization specific office and cubicle abbreviation values as well as resource type to be created.
-$OfficeAbbr = 'OF'
-$CubicleAbbr = 'WS'
-$ResourceType = 'Workspace'
-
-# [REQUIRED] Set organization name, domain, and Azure subscription ID if using managed identity.
-$OrganizationName = 'ORGANIZATION-NAME-HERE'
-$FSDomain = 'FRESH-SERVICE-DOMAIN-HERE'
-$DomainName = 'M365-DEFAULT-DOMAIN-HERE'
-$SubscriptionId = 'AZURE-SUBSCRIPTION-ID-HERE'
-$AdminGroup = 'MAIL-ENABLED-SECURITY-GROUP-HERE'
-
-# [OPTIONAL] Set Keyvault and credential name variables for retrieving credentials from Azure Keyvault to authenticate to other API supported systems such as an ITSM.
-$KeyvaultName = 'KEY-VAULT-NAME-HERE'
-$CredentialName = 'CREDENTIAL-NAME-HERE'
-
-# [REQUIRED] Office locations
-$OfficeLocations = @(
-
-# Office 1 details
-  @{
-    Name = 'Main Campus'
-    RoomList = 'roomlist1@contoso.com'
-    Building = 'Bldg 1'
-    Street = '2 Microsoft Way'
-    City = 'Redmond'
-    State = 'WA'
-    Zipcode = '13464'
-    Country = 'United States'
-  }
-
-  # Office 2 details
-  @{
-    Name = 'Engineering Bldg'
-    RoomList = 'roomlist2@contoso.com'
-    Building = 'Bldg 2'
-    Street = '2 Microsoft Way'
-    City = 'Redmond'
-    State = 'WA'
-    Zipcode = '13464'
-    Country = 'United States'
-  }
-  # Office 3 details
-  @{
-    Name = 'Research & Development Bldg'
-    RoomList = 'roomlist3@contoso.com'
-    Building = 'Bldg 3'
-    Street = '3 Microsoft Way'
-    City = 'Redmond'
-    State = 'WA'
-    Zipcode = '13464'
-    Country = 'United States'
-  }
+Param(
+     [parameter(Mandatory=$true)]
+     [Object]$WebhookData
 )
 
-$JsonSchema = '{
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "type": "object",
-  "properties": {
-    "Office": {
-      "type": "string",
-      "description": "The name of the office."
-    },
-    "FloorNum": {
-      "type": "integer",
-      "description": "The floor number of the office."
-    },
-    "FloorLabel": {
-      "type": "string",
-      "description": "The label for the floor."
-    },
-    "Capacity": {
-      "type": "integer",
-      "description": "The capacity of the office."
-    },
-    "WheelChairAccessible": {
-      "type": "boolean",
-      "description": "Indicates whether the office is wheelchair accessible."
-    },
-    "OfficeId": {
-      "type": "string",
-      "description": "The unique identifier for the office."
-    },
-    "Moderators": {
-      "type": "string",
-      "description": "The moderator(s) associated with the office."
-    },
-    "CalendarPermissions": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      },
-      "description": "Permissions associated with the office calendar."
-    },
-    "CubicleId": {
-      "type": "string",
-      "description": "The unique identifier for the cubicle."
-    },
-    "TicketId": {
-      "type": "integer",
-      "description": "The identifier for a related ticket."
-    },
-    "ServiceRequestItemId": {
-      "type": "integer",
-      "description": "The identifier for a related service request item."
-    }
-  },
-  "required": ["Office", "FloorNum", "FloorLabel", "Capacity", "WheelChairAccessible", "Moderators", "CalendarPermissions"],
-  "oneOf": [
-    {
-      "required": ["OfficeId"],
-      "not": {
-        "required": ["CubicleId"]
-      }
-    },
-    {
-      "required": ["CubicleId"],
-      "not": {
-        "required": ["OfficeId"]
-      }
-    }
-  ]
-}'
+Import-Module ExchangeOnlineManagement
+Import-Module Az.KeyVault -RequiredVersion "4.9.2"
 
-<# Checks parameter set and set booleans depending on set chosen.
-switch ($PSCmdlet.ParameterSetName) {
-
-  'OfficeSet' {
-    if ($OfficeId) 
-    {
-      $IsOffice = $true 
-    }
-  }
-  'CubicleSet' {
-    if ($CubicleId)
-    {
-      $IsCubicle = $true
-    }
-  }
-}#>
-
-# Populate variables with webhook data, if provided.
-if ($WebhookData)
+# Validates request body is present and attempts to convert to PowerShell object.
+if ($WebhookData.RequestBody) 
 {
-  # Outputs request header details.
-  Write-Output $WebhookData.RequestHeader
-
-  if ($WebhookData.RequestBody) 
-  {
     try {
-      if ($ValidWebhookData = Test-Json -Json $WebbookData.RequestBody -Schema $JsonSchema)
-      {
-        # Converts request body from JSON request body to PS Object.
-        $PayloadRequestBody = (ConvertFrom-Json -InputObject $WebhookData.RequestBody)
-  
-        # Set PS variables for basic office attributes.
-        $Office = $PayloadRequestBody.location.Trim()
-        $FloorNum = $PayloadRequestBody.floornum.Trim()
-        $FloorLabel = $PayloadRequestBody.floorlabel.Trim()
-        $Capacity = $PayloadRequestBody.capacity.Trim()
-        $WheelChairAccessible = $PayloadRequestBody.wheelchairaccessible
-        $OfficeId = $PayloadRequestBody.officeid.Trim()
-        $CubicleId = $PayloadRequestBody.cubicleid.Trim()
-        $Moderators = $PayloadRequestBody.Moderators.Split(',').Trim()
-        $CalendarPermissions = $PayloadRequestBody.calendarpermissions.Split(',').Trim()
-        $TicketID = $PayloadRequestBody.ticketid.Trim()
-        $ServiceRequestItemID = ($PayloadRequestBody.itemrequestid -replace '[\[\]]', '').Trim()
-
-        # [OPTIONAL] Set API URLs for Freshservice tenant with unique ticket ID and service request item ID.
-
-        # Private note URL with unique ticket ID.
-        $FreshserviceCreatePrivateNoteUpdateURL = "https://$FSDomain/api/v2/tickets/$TicketID/notes"
-
-        # Service Request item URL with unique request item ID
-        $FreshserviceUpdateServiceRequestItemStatusURL = "https://$FSDomain/api/v2/tickets/$TicketID/requested_items/$ServiceRequestItemID"
-      }
+        $PayloadRequestBody = ConvertFrom-Json -InputObject $WebhookData.RequestBody
     }
     catch {
-      Write-Error -Message "$($Error[0].Exception.Message)"
-      Exit 1
+        throw "Unable to parse JSON in API request."
     }
-  }
-}
-elseif ($JsonOnly)
-{  
-  if ($ValidJson = Test-Json -Json $Json -Schema $JsonSchema)
-  {
-    try {
-      # Converts request body from JSON request body to PS Object.
-      $PSObject = (ConvertFrom-Json -InputObject $Json)
-
-      # Set PS variables for basic office attributes.
-      $Office = ($PSObject.location).Trim()
-      $FloorNum = ($PSObject.floornum).Trim()
-      $FloorLabel = ($PSObject.floorlabel).Trim()
-      $Capacity = ($PSObject.capacity).Trim()
-      $WheelChairAccessible = $PSObject.wheelchairaccessible
-      $OfficeId = ($PSObject.officeid).Trim()
-      $CubicleId = ($PSObject.cubicleid).Trim()
-      $Moderators = ($PSObject.Moderators.Split(',')).Trim()
-      $CalendarPermissions = ($PSObject.calendarpermissions).Trim().Split(',')
-
-    }
-    catch {
-      Write-Error -Message "$($Error[0].Exception.Message)"
-      Exit 1
-    }
-  }
 }
 
-if ($KeyvaultName -and $CredentialName)
-{
-  # Set parameters for Get-AzKeyVaultSecret cmdlet to securely retrieve Freshservice Agent API creds for Freshservice API requests.
-  $KeyVaultParams = @{
-    Name = $CredentialName
-    VaultName = $KeyvaultName
-    AsPlainText = $true
-  }
-}
-if ($ValidWebhookData)
-{
-  try {
-  # Connect to Azure for retrieving credentials.
-  Connect-AzAccount -Subscription $SubscriptionId -Identity
-    
-  }
-  catch {
-    Write-Error -Message "$($Error[0].Exception.Message)"
-    Exit 1
-  }
+# Set PS variables for basic office attributes.
+$Office = $PayloadRequestBody.location
+$FloorNum = $PayloadRequestBody.floornum
+$FloorLabel = $PayloadRequestBody.floorlabel
+$Capacity = $PayloadRequestBody.capacity
+$WheelChairAccessible = $PayloadRequestBody.wheelchairaccessible
+$OfficeId = $PayloadRequestBody.officeid
+$CubicleId = $PayloadRequestBody.cubicleid
+$Managers = $PayloadRequestBody.managers.Split(',').Trim()
+$Permissions = $PayloadRequestBody.permissions.Split(',')
+$ManagementScope = $PayloadRequestBody.managementscope
+$TicketID = $PayloadRequestBody.ticketid
+$ServiceRequestItemID = $PayloadRequestBody.itemrequestid -replace '[\[\]]', ''
 
-  # Sets header info for Freshservice API call. Retrieves Freshservice API key from Azure Key Vault and encodes using Base64.
-  $Headers = @{
+# Sets organization name, domain, and Azure subscription ID.
+$OrganizationName = 'OrganizationName'
+$FSDomain = 'FreshserviceDomain'
+$DomainName = 'DomainName'
+$SubscriptionId = 'SubscriptionId'
+
+# Sets Keyvault name, credential name, and administrative group variables for managing workspace resources.
+$KeyvaultName = 'KeyvaultName'
+$CredentialName = 'CredentialName'
+$AdminGroup = 'AdminGroupEmail'
+
+# Sets parameters for Get-AzKeyVaultSecret cmdlet to securely retrieve Mr. Automation's API creds for Freshservice API requests.
+$KeyVaultParams = @{
+Name = $CredentialName
+VaultName = $KeyvaultName
+AsPlainText = $true
+}
+
+# Set office and cubicle abbreviation values as well as resource type to be created.
+$OfficePrefix = 'OF'
+$CubiclePrefix = 'WS'
+$ResourceType = 'Workspace'
+
+# Initalize string variables for valid managers
+$ValidManagers = $null
+$InvalidManagers = $null
+
+# Connect to Azure for retrieving credentials (requires managed identity to be enabled)
+Connect-AzAccount -Subscription $SubscriptionId -Identity -Verbose
+
+# Connect to Exchange Online using managed identity (requires managed identity to be enabled + Office 365 Exchange Online role with claim of Exchange.ManageAsApp)
+Connect-ExchangeOnline -ManagedIdentity -Organization $DomainName -Verbose
+
+# Sets API URLs while including unique ticket ID and service request item ID.
+$FreshserviceCreatePrivateNoteUpdateURL = "https://$FSDomain/api/v2/tickets/$TicketID/notes"
+$FreshserviceUpdateServiceRequestItemStatusURL = "https://$FSDomain/api/v2/tickets/$TicketID/requested_items/$ServiceRequestItemID"
+
+# Sets header info for Freshservice API call. Retrieves Freshservice API key from Azure Key Vault and encodes using Base64 (requires )
+$Headers = @{
     "Authorization" = ("Basic" + " " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(('{0}:{1}' -f (Get-AzKeyVaultSecret @KeyVaultParams), $null))) )
     "Content-Type" = "application/json"
-  }
 }
-  # Sets room list info based on provided office name.
-  foreach ($Location in $OfficeLocations)
-  {
-    if ($Office_Of -eq $Location.Name)
-    {
-      $Office = $Location
-    }
-    elseif ($Office_Cu -eq $Location.Name)
-    {
-      $Office = $Location
-    }
-  }
 
-    # Set username using office abbreviation code and office ID #.
-    if ($IsOffice)
-    {
-      $Username = ($Office.Bldg.ToLower() + "-" + $OfficeAbbr.ToLower() + "-" + $OfficeId)
-      $DisplayName = ($OfficeAbbr + " " + $OfficeId.ToUpper())
-    }
-    if ($IsCubicle)
-    {
-      $Username = ($Office.Bldg.ToLower() + "-" + $CubicleAbbr.ToLower() + "-" + $CubicleId)
-      $DisplayName = ($CubicleAbbr + " " + $CubicleId.ToUpper())
-    }
+# Sets room list based on provided office name (requires pre-existing room lists to be defined - see New-ExchangeRoomList.ps1 to create)
+if ($Office -eq "Office 1")
+{
+    $RoomList = "RoomListEmail1"
+    $Building = "Building A"
+    $Street = "1000 Fake Blvd, Ste 300"
+    $City = "New York"
+    $State = "NY"
+    $Zipcode = "14534"
+    $Country = 'United States'
+}
+elseif ($Office -eq "Office 2")
+{
+    $RoomList = "RoomListEmail2"
+    $Building = "Building C"
+    $Street = "443 Another Fake Blvd"
+    $City = "San Francisco"
+    $State = "CA"
+    $Zipcode = "43249"
+    $Country = 'United States'
+}
+elseif ($Office -eq "Office 3")
+{
+    $RoomList = "RoomListEmail3"
+    $Building = "Building 200"
+    $Street = "4234 Park Ave"
+    $City = "Cincinatti"
+    $State = "OH"
+    $Zipcode = "34245"
+    $Country = 'United States'
+}
 
-    ################################################################################################################  **Parameters for resource settings**  ###################################################################################################################################################
+# Set username using office abbreviation code and office ID #.
+if ($OfficeId)
+{
+    $IsOffice = $true
+    $Username = ($Building.ToLower() + "-" + $OfficePrefix.ToLower() + "-" + $OfficeId)
+    $DisplayName = ($OfficePrefix + " " + $OfficeId.ToUpper())
+}
+if ($CubicleId)
+{
+    $Username = ($Building.ToLower() + "-" + $CubiclePrefix.ToLower() + "-" + $CubicleId)
+    $DisplayName = ($CubiclePrefix + " " + $CubicleId.ToUpper())
+}
 
-    # Base parameters for Set-Place cmdlet. Indicates basic resource location information.
-    $SetPlaceParams = @{
-      Identity = $Username
-      Building = $Office
-      Capacity = $Capacity
-      Street = $Street
-      City = $City
-      State = $State
-      PostalCode = $Zipcode
-      CountryOrRegion = $Country
-      Floor = $FloorNum
-      FloorLabel = $FloorLabel
-    }
+################################################################################################################  **Parameters for resource settings**  ###################################################################################################################################################
 
-    # Appends parameter to Set-Place cmdlet if resource is handicap accessible.
-    if ($WheelChairAccessible)
-    {
-      # Parameters for Set-Place cmdlet.
-      $SetPlaceParams += @{ IsWheelChairAccessible = $true }
-    }
+# Base parameters for Set-Place cmdlet. Indicates basic resource location information.
+$SetPlaceParams = @{
+    Identity = $Username
+    Building = $Building
+    Capacity = $Capacity
+    Street = $Street
+    City = $City
+    State = $State
+    PostalCode = $Zipcode
+    CountryOrRegion = $Country
+    Floor = $FloorNum
+    FloorLabel = $FloorLabel
+}
+# Appends parameter to Set-Place cmdlet if resource is handicap accessible.
+if ($WheelChairAccessible)
+{
+    # Parameters for Set-Place cmdlet.
+    $SetPlaceParams += @{ IsWheelChairAccessible = $true }
+}
 
-    # Parameters for Set-CalendarProcessing cmdlet.
-    $SetCalendarProcessingParams = @{
-      Identity = $Username
-      AutomateProcessing = "AutoAccept"
-      AllowConflicts = $false
-      AllowRecurringMeetings = $true
-      EnforceCapacity = $true
-      RemoveOldMeetingMessages = $true
-      RemoveCanceledMeetings = $true
-      Confirm = $false
-    }
+# Parameters for Set-CalendarProcessing cmdlet.
+$SetCalendarProcessingParams = @{
+    Identity = $Username
+    AutomateProcessing = "AutoAccept"
+    AllowConflicts = $false
+    AllowRecurringMeetings = $true
+    EnforceCapacity = $true
+    RemoveOldMeetingMessages = $true
+    RemoveCanceledMeetings = $true
+    Confirm = $false
+}
 
-    # Parameters for Add-DistributionGroupMember cmdlet. Adds resource to room list (distribution list group) to allow resource to be found in Outlook Room Finder tool.
-    $AddDistributionGroupMemberParams = @{
-      Identity = $RoomList
-      Member = $Username
-      Confirm = $false
-    }
+# Parameters for Add-DistributionGroupMember cmdlet. Adds resource to room list (distribution list group) to allow resource to be found in Outlook Room Finder tool.
+$AddDistributionGroupMemberParams = @{
+    Identity = $RoomList
+    Member = $Username
+    Confirm = $false
+}
 
-    # Parameters for New-Mailbox cmdlet. Creates room resource.
-    $NewMailboxParams = @{
-      Name = $Username
-      Room = $true
-      Confirm = $false
-    }
+# Parameters for New-Mailbox cmdlet. Creates room resource.
+$NewMailboxParams = @{
+    Name = $Username
+    Room = $true
+    Confirm = $false
+}
 
-    # Parameters for Add-MailboxFolderPermission cmdlet. Adds editor rights to administrative groups.
-    $AddMailboxParams = @{
-      Identity = $Username + ":\calendar"
-      AccessRights = "Editor"
-      Confirm = $false
-    }
+# Parameters for Add-MailboxFolderPermission cmdlet. Adds editor rights to administrative groups.
+$AddMailboxParams = @{
+    Identity = $Username + ":\calendar"
+    AccessRights = "Editor"
+    Confirm = $false
+}
 
-    # Parameters for Set-Mailbox cmdlet. Sets Display Name, Name, and type to Workspace.
-    $SetMailboxParams = @{
-      Identity = $Username
-      Type = $ResourceType
-      Name = $DisplayName
-      DisplayName = $DisplayName
-      Confirm = $false
-    }
+# Parameters for Set-Mailbox cmdlet. Sets Display Name, Name, and type to Workspace.
+$SetMailboxParams = @{
+    Identity = $Username
+    Type = $ResourceType
+    Name = $DisplayName
+    DisplayName = $DisplayName
+    Confirm = $false
+}
 
-    $SetUserParams = @{
-      Identity = $Username
-      Company =  $OrganizationName
-      Confirm = $false
-    }
+$SetUserParams = @{
+    Identity = $Username
+    Company =  $OrganizationName
+    Confirm = $false
+}
 
-    # Sets delegate approval policy for office requests.
-    if ($IsOffice)
-    {
-      $SetCalendarProcessingParams += @{
+# Sets manager approval policy for office requests.
+if ($IsOffice)
+{
+    $SetCalendarProcessingParams += @{
         AllRequestInPolicy = $true
         AllBookInPolicy = $false
         ForwardRequestsToDelegates = $true
         TentativePendingApproval = $true
         AddNewRequestsTentatively = $true
-      }
     }
+}
 
-    ################################################################################################################  **Delegate and calendar permission settings for resource settings**  ##################################################################################################################
-    
-    # Authenticate as managed identity to Exchange Online if webhook trigger is used.
-    if ($ValidWebhookData)
-    {
-      try {
-        # Connect to Exchange Online using managed identity
-        Connect-ExchangeOnline -ManagedIdentity -Organization $DomainName -ShowBanner:$false
-      }
-      catch {
-        Write-Error -Message "$($Error[0].Exception.Message)"
-        Exit 1
-      }
-    }
+# Sets management scope of resources (single vs all new and existing)
+if ($ManagementScope -eq "Single reservable resource (this resource only)")
+{
+    $SingleResourceScope = $true
+}
+elseif ($ManagementScope -eq "All reservable resources (new and existing)")
+{
+    $AllResourceScope = $true
+}
 
-    # Authenticate as administrator to Exchange Online if parameters or JSON data is supplied.
-    if ($ValidJson)
-    {
-      try {
-        # Connect to Exchange Online as administrator.
-        Connect-ExchangeOnline -ShowBanner:$false
-      }
-      catch {
-        Write-Error -Message "$($Error[0].Exception.Message)"
-        Exit 1
-      }
-    }
-    # Set parameters for Set-CalendarProcessing cmdlet based on if delegate is provided.
-    if ($Moderators)
-    {
-      $ValidModerators = $null
-      $InvalidModerators = $null
+################################################################################################################  ** Manager and calendar permission settings for resource settings **  ##################################################################################################################
 
-      foreach ($Moderator in $Moderators)
-      {
-        Write-Output "Looping through moderators for validation. Current moderator: $Moderator"
+
+# Set parameters for Set-CalendarProcessing cmdlet based on if manager is provided.
+if ($Managers)
+{  
+    $OldPref = $ErrorActionPreference
+    $ErrorActionPreference = 'Stop'
+
+    foreach ($Manager in $Managers)
+    {
+        Write-Output "Looping through managers for validation. Current manager: $Manager"
         try 
         {
-            $OldPref = $global:ErrorActionPreference
-            $global:ErrorActionPreference = 'Stop'
+            # Validate manager email address before setting processing rules.
+            Get-EXOMailbox -Identity $Manager
 
-            # Validate delegate email address before setting processing rules.
-            Get-EXOMailbox -Identity $Moderator | Out-Null
-
-            # Concatenate valid delegate to string.
-            $ValidModerators = $ValidModerators + $Moderator + ","
+            # Concatenate valid manager to string.
+            $ValidManagers = $ValidManagers + $Manager + ","
             
             # Loop through each permission provided in request
-            foreach ($Permission in $CalendarPermissions)
+            foreach ($Permission in $Permissions)
             {
                 # Set parameters for adding editor permissions to resource calendar.
-                if ($Permission -eq "Editor")
+                if ($Permission -eq "Editor (manage existing meetings)")
                 {
                     $EditorRights = $true
-                    Write-Output "Editor permissions assigned to $Moderator"
+                    Write-Output "Editor permissions assigned to $Manager"
                 }
 
-                # Add delegate approver to resource.
-                if ($Permission -eq "Delegate")
+                # Add manager approver to resource.
+                if ($Permission -eq "Approver")
                 {
-                    # Set delegate rights boolean to true.
-                    $DelegateRights = $true
-                    Write-Output "Delegate permissions assigned to $Moderator"
+                    # Set manager rights boolean to true.
+                    $ApproverRights = $true
+                    Write-Output "Approver permissions assigned to $Manager"
                 }
             }
-        }
+        } 
         catch 
         {
             # Write error output to stream.
-            Write-Error "Unable to find user $Moderator in Exchange. Skipping moderator assignment" # $Error[0].Exception.Message
+            Write-Error "Unable to find manager $Manager in Exchange. Skipping manager assignment"
 
-            # Concatenate invalid moderator to string.
-            $InvalidModerators = $InvalidModerators + $Moderator + ","
+            # Concatenate invalid manager to string.
+            $InvalidManagers= $InvalidManagers + $Manager + ","
         }
-        finally 
-        {
-            # Set global error action preference to default.
-            $global:ErrorActionPreference = $OldPref
-        }
-      }
-
-      # Check if delegate flag was added in request.
-      if ($DelegateRights -and $ValidModerators)
-      {
-          # Write to output stream results of check.
-          Write-Output "Valid moderators: " + $ValidModerators.Trim(',')
-
-          # Parameters for Set-CalendarProcessing cmdlet.
-          $SetCalendarProcessingParams += @{ ResourceDelegates = $ValidModerators.Trim(',') }
-      }
-     }
-
-    ################################################################################################################  **Runs cmdlets to set various settings defined in "Parameters for resource settings" and API calls**  #####################################################################################
-    
-    if ($ValidWebhookData)
-    {
-      # Sets API request body request based on success, failure, or warnings.
-      $NewPrivateNoteSuccessBody = '{ "body":"<div>The resource ' + '<b>' + $DisplayName + ' (' + $Username + ')' + '</b>' + ' has successfully created. <br><br> Please allow up to 24 hours for the resource to appear in Outlook Room Finder.</div>", "private":true }'
-      $NewPrivateNoteFailureBody = '{ "body":"<div>The resource ' + '<b>' + $DisplayName + ' (' + $Username + ')' + '</b>' + ' has failed to create. <br><br> Please reach out to your systems administrator for further assistance. Do <b>NOT</b> re-submit this request.</div>", "private":true }'
-      $NewPrivateNoteResourceExistsBody = '{ "body":"The resource ' + '<b>' + $DisplayName + ' (' + $Username + ')' + '</b>' + ' already exists. <br><br> Please check the information provided and try again by creating a new service request ticket.</div>", "private":true }'
-      $InvalidModeratorBody = '{ "body":"<div>The moderator(s) ' + '<b>' + $InvalidModerators.Trim(',') + '</b>' + ' do not contain valid email address(es).<br><br> Please reach out to your systems administrator for further assistance. Do <b>NOT</b> re-submit this request.</div>", "private":true }'
-      $UpdateRequestedItemStatusCancelledBody = '{ "stage":3 }'
-      $UpdateRequestedItemStatusFulfilledBody = '{ "stage":4 }'
     }
-    # Check if identity exists before attempting operations. If no results are returned, proceed.
-    if (!(Get-EXOMailbox -Identity $Username))
-    {
+    $ErrorActionPreference = $OldPref
+}
+
+
+################################################################################################################  **Runs cmdlets to set various settings defined in "Parameters for resource settings" and API calls**  #####################################################################################
+
+# Sets API request body request based on success, failure, or warnings.
+$NewPrivateNoteSuccessBody = '{ "body":"<div>The resource ' + '<b>' + $DisplayName + ' (' + $Username + ')' + '</b>' + ' has successfully created. <br><br> Please allow up to 24 hours for the resource to appear in Outlook Room Finder.</div>", "private":true }'
+$NewPrivateNoteFailureBody = '{ "body":"<div>The resource ' + '<b>' + $DisplayName + ' (' + $Username + ')' + '</b>' + ' has failed to create. <br><br> Please reach out to your systems administrator for further assistance. Do <b>NOT</b> re-submit this request.</div>", "private":true }'
+$NewPrivateNoteResourceExistsBody = '{ "body":"The resource ' + '<b>' + $DisplayName + ' (' + $Username + ')' + '</b>' + ' already exists. <br><br> Please check the information provided and try again by creating a new service request ticket.</div>", "private":true }'
+if ($InvalidManagers) { $InvalidManagerBody = '{ "body":"<div>The manager(s) ' + '<b>' + $InvalidManagers.Trim(',') + '</b>' + ' do not contain valid email address(es).<br><br> Please reach out to your systems administrator for further assistance. Do <b>NOT</b> re-submit this request.</div>", "private":true }' }
+$UpdateRequestedItemStatusCancelledBody = '{ "stage":3 }'
+$UpdateRequestedItemStatusFulfilledBody = '{ "stage":4 }'
+
+# Check if identity exists before attempting operations. If no results are returned, proceed.
+
+try 
+{
+    $OldPref = $ErrorActionPreference
+    $ErrorActionPreference = 'Stop'
+
+    # Attempt to retrieve existing identity.
+    $PreMailboxCheck = Get-EXOMailbox -Identity $Username
+}
+catch 
+{
     # Create resource mailbox.
     New-Mailbox @NewMailboxParams
 
     # Set Company Name attribute associated with resource.
     Set-User @SetUserParams
-
+    
     # Set mailbox Display Name and type to Workspace.
     Set-Mailbox @SetMailboxParams
 
-    # Set 30 second timer to allow resources to propagate prior to setting other resource values.
-    Start-Sleep -Seconds 30
+    # Set 30 second timer to allow resource to propagate prior to setting other resource values.
+    Start-Sleep -Seconds 10
 
     # Set workspace details for location capacity, country, floor number, floor label, and wheelchair accessability.
     Set-Place @SetPlaceParams
@@ -583,80 +385,221 @@ if ($ValidWebhookData)
     # Add Workspace as member to room list based on desginated Room List for an office.
     Add-DistributionGroupMember @AddDistributionGroupMemberParams
 
-    # Set standard resource calendar processing rules.
+    # Set resource calendar processing rules.
     Set-CalendarProcessing @SetCalendarProcessingParams
 
-    # Sets editor permissions on resource mailbox if flag for editor and approver rights are provided in the initial request.
-    if ($ApproverRights -and $EditorRights)
-    {
+    $ErrorActionPreference = $OldPref
 
-    }
-    # Sets delegate permissions on resource mailbox if flag for approver rights are provided in the initial request.
-    elseif ($ApproverRights)
-    {
 
-    }
-    # Sets delegate permissions on resource mailbox if flag for approver rights are provided in the initial request.
-    elseif ($EditorRights)
+    # Assigns appropriate delegate and or editor permissions to this resource as well as any future and existing resources.
+    if ($AllResourceScope) 
     {
-      foreach ($Moderator in $ValidModerators.Split(','))
-      {
-          try { Add-DistributionGroupMember -Identity $AdminGroup -Member $Moderator } catch { if ($Error[0].Exception.Message -match "Microsoft.Exchange.Management.Tasks.MemberAlreadyExistsException") { Write-Warning "User is already a member of group $AdminGroup" } else { Write-Error       Write-Error -Message "$($Error[0].Exception.Message)" } }
-      }
+        # Assigns "approver" delegate and calendar editor permissions to all resource management group.
+        if ($EditorRights -and $ApproverRights -and $ValidManagers)
+        {
+            foreach ($Manager in $ValidManagers.Split(','))
+            {
+                try 
+                { 
+                    # Assign editor rights to mail-enabled security group.
+                    Add-DistributionGroupMember -Identity $AdminGroup -Member $Manager 
+                } 
+                catch { $_ }
+            }
 
-      # Assigns appropriate mailbox permissions to admin group.
-      Add-MailboxFolderPermission @AddMailboxParams -User $AdminGroup 
+            try 
+            {
+                # Assigns calendar editor permissions to admin group.
+                Add-MailboxFolderPermission @AddMailboxParams -User $AdminGroup 
+            }
+            catch { $_ }
+
+            try
+            {
+                # Updates calendar processing to include administrative group as a delegate.
+                Set-CalendarProcessing -Identity $Username -ResourceDelegates $AdminGroup -Confirm:$false 
+            }
+            catch { $_}
+        }
+
+
+        # Sets manager permissions on resource mailbox if flag for approver rights are provided in the initial request.
+        elseif ($EditorRights -and $ValidManagers)
+        {
+            foreach ($Manager in $ValidManagers.Split(','))
+            {
+                try 
+                { 
+                    # Assign editor rights to mail-enabled security group.
+                    Add-DistributionGroupMember -Identity $AdminGroup -Member $Manager 
+                } 
+                catch { $_ }
+            }
+
+            try 
+            {
+                # Assigns calendar editor permissions to admin group.
+                Add-MailboxFolderPermission @AddMailboxParams -User $AdminGroup 
+            }
+            catch { $_ }
+        }
+
+        # Check if manager approver flag was added in request.
+        elseif ($ApproverRights -and $ValidManagers)
+        {
+            try
+            {
+                # Updates calendar processing to include administrative group as a delegate.
+                Set-CalendarProcessing -Identity $Username -ResourceDelegates $AdminGroup -Confirm:$false 
+            }
+            catch { $_ }
+
+            try
+            {
+                # Removes unintended editor rights to calendar automatically applied when using the Set-CalendarProcessing cmdlet to add resource delegates.
+                Remove-MailboxFolderPermission -Identity "$($Username):\calendar" -User $AdminGroup -Confirm:$false 
+            }
+            catch { $_ }
+        }
     }
+}
+
+# Assigns appropriate delegate and or editor permissions to this resource onlu for all managers. 
+elseif ($SingleResourceScope)
+{
+    # Assigns "approver" delegate and calendar editor permissions to individuals.
+    if ($EditorRights -and $ApproverRights -and $ValidManagers)
+    {
+        foreach ($Manager in $ValidManagers.Split(','))
+        {
+            try 
+            {
+                # Assign editor rights to indvidual managers on this resource only.
+                Add-MailboxFolderPermission @AddMailboxParams -User $Manager
+            }
+            catch { $_ }
+        }
+        try 
+        {
+            # Updates calendar processing to include specific managers as delegate to this resource only.
+            Set-CalendarProcessing -Identity $Username -ResourceDelegates $ValidManagers.Trim(',') -Confirm:$false
+        }
+        catch { $_ }
+    }
+
+    # Sets manager permissions on resource mailbox if flag for approver rights are provided in the initial request.
+    elseif ($EditorRights -and $ValidManagers)
+    {
+        foreach ($Manager in $ValidManagers.Split(','))
+        {
+            try 
+            {
+                # Assign editor rights to indvidual managers on this resource only.
+                Add-MailboxFolderPermission @AddMailboxParams -User $Manager
+            }
+            catch { $_ }
+        }
+    }
+
+    # Check if manager approver flag was added in request.
+    elseif ($ApproverRights -and $ValidManagers)
+    {
+        try 
+        {
+            # Updates calendar processing to include specific managers as delegate to this resource only.
+            Set-CalendarProcessing -Identity $Username -ResourceDelegates $ValidManagers.Trim(',') -Confirm:$false
+        }
+        catch { $_ }
+
+        try
+        {
+            $ManagerList = $ValidManagers.Trim(',').Split(',') | Where-Object { $_ -ne "" }
+
+            foreach ($Manager in $ManagerList) 
+            {
+                try
+                {
+                    # Removes unintended editor rights to calendar automatically applied when using the Set-CalendarProcessing cmdlet to add resource delegates.
+                    Remove-MailboxFolderPermission -Identity "$($Username):\calendar" -User $Manager -Confirm:$false 
+                }
+                catch { $_ }
+            }
+        }
+        catch { $_ }
+    }
+}
 
 ################################################################################################################  **Post resource mailbox creation check**  #############################################################################################################################################
 
-# Verify post mailbox creation.
-if (Get-EXOMailbox -Identity $Username)
+if (-not $PreMailboxCheck)
 {
-  if ($ValidWebhookData)
-  {
-  # Create private note with success status, and update requested item status to 'Fullfilled'.
-    Invoke-WebRequest -Uri $FreshserviceCreatePrivateNoteUpdateURL -Headers $Headers -Method Post -Body $NewPrivateNoteSuccessBody -UseBasicParsing
-    Invoke-WebRequest -Uri $FreshserviceUpdateServiceRequestItemStatusURL -Headers $Headers -Method Put -Body $UpdateRequestedItemStatusFulfilledBody -UseBasicParsing
-  }
+    try 
+    {
+        $OldPref = $ErrorActionPreference
+        $ErrorActionPreference = 'Stop'
 
-  # Writes output to screen indicating that the resource creation was successful.
-  Write-Output "Resource successfully created!"
+        # Verify post mailbox creation.
+        $PostMailboxCheck = Get-EXOMailbox -Identity $Username
+
+        # Output success message to stream
+        Write-Output "The resource '$($Username)' created successfully."
+
+        $ErrorActionPreference = $OldPref
+        
+        if ($PostMailboxCheck)
+        {
+            try
+            {
+                # Create private note with success status, and update requested item status to 'Fullfilled'.
+                Invoke-WebRequest -Uri $FreshserviceCreatePrivateNoteUpdateURL -Headers $Headers -Method Post -Body $NewPrivateNoteSuccessBody -UseBasicParsing
+                Invoke-WebRequest -Uri $FreshserviceUpdateServiceRequestItemStatusURL -Headers $Headers -Method Put -Body $UpdateRequestedItemStatusFulfilledBody -UseBasicParsing
+            }
+            catch { Write-Error "Unable to update ticket status indicating that '$($Username)' created successfully with requested item status of 'Fulfulled'." }
+        }
+    }
+    catch 
+    {
+        # Output error to stream.
+        Write-Error "The resource '$($Username)' failed to create."
+
+        try
+        {
+            # Create private note with failure status and update requested item status to 'Cancelled'.
+            Invoke-WebRequest -Uri $FreshserviceCreatePrivateNoteUpdateURL -Headers $Headers -Method Post -Body $NewPrivateNoteFailureBody -UseBasicParsing
+            Invoke-WebRequest -Uri $FreshserviceUpdateServiceRequestItemStatusURL -Headers $Headers -Method Put -Body $UpdateRequestedItemStatusCancelledBody -UseBasicParsing
+        }
+        catch { Write-Error "Unable to update ticket status indicating that '$($Username)' failed to create with requested item status of 'Cancelled'."}
+    }
 }
-else 
-{
-  if ($ValidWebhookData)
-  {
-    # Create private note with failure status and update requested item status to 'Cancelled'.
-    Invoke-WebRequest -Uri $FreshserviceCreatePrivateNoteUpdateURL -Headers $Headers -Method Post -Body $NewPrivateNoteFailureBody -UseBasicParsing
-    Invoke-WebRequest -Uri $FreshserviceUpdateServiceRequestItemStatusURL -Headers $Headers -Method Put -Body $UpdateRequestedItemStatusCancelledBody -UseBasicParsing
-  }
- }
-}
-else 
-{
-  if ($ValidWebhookData)
-  {
-    # Create private note indicating that resource already exists and update requested item status to 'Cancelled'.
-    Invoke-WebRequest -Uri $FreshserviceCreatePrivateNoteUpdateURL -Headers $Headers -Method Post -Body $NewPrivateNoteResourceExistsBody -UseBasicParsing
-    Invoke-WebRequest -Uri $FreshserviceUpdateServiceRequestItemStatusURL -Headers $Headers -Method Put -Body $UpdateRequestedItemStatusCancelledBody -UseBasicParsing
-  }
 
-  # Write output to screen indicating that resource already exists
-  Write-Output "Resource already exists. Please re-try using a unique indentifier to proceed."
+if ($InvalidManagers)
+{
+    try
+    {
+        # Create private note indicating that the resource manager was not applied due to an invalid email address.
+        Invoke-WebRequest -Uri $FreshserviceCreatePrivateNoteUpdateURL -Headers $Headers -Method Post -Body $InvalidManagerBody -UseBasicParsing
+    }
+    catch { Write-Error "Unable to update ticket status indicating that '$($InvalidManagers)' are invalid." }
+
 }
 
-if ($InvalidModerators)
+if ($PreMailboxCheck)
 {
-  if ($ValidWebhookData)
-  {
-    # Create private note indicating that the resource moderator was not applied due to an invalid email address.
-    Invoke-WebRequest -Uri $FreshserviceCreatePrivateNoteUpdateURL -Headers $Headers -Method Post -Body $InvalidModeratorBody -UseBasicParsing
-  }
+    # Output error to stream.
+    Write-Error "The resource $Username already exists."
 
-  # Write output to screen indicating that one or more resource moderators were not applied to the resource due to an invalid identity.
-  Write-Output "Unable to assign one or more moderators due to an invalid identity."
+    try
+    {
+        # Create private note indicating that resource already exists and update requested item status to 'Cancelled'.
+        Invoke-WebRequest -Uri $FreshserviceCreatePrivateNoteUpdateURL -Headers $Headers -Method Post -Body $NewPrivateNoteResourceExistsBody -UseBasicParsing
+        Invoke-WebRequest -Uri $FreshserviceUpdateServiceRequestItemStatusURL -Headers $Headers -Method Put -Body $UpdateRequestedItemStatusCancelledBody -UseBasicParsing
+    }
+    catch { Write-Error "Unable to update ticket status indicating the resource '$($Username)' already exists with requested item status of 'Cancelled'." }
+
 }
 
 # Disconnect from Exchange Online session.
 Disconnect-ExchangeOnline -Confirm:$false
+
+
+#######################################################################################################################################################################################################################################################################################################
