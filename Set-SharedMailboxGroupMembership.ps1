@@ -7,6 +7,7 @@ Import-Module ExchangeOnlineManagement -SkipEditionCheck
 
 
 $GroupId = 'GROUP-ID-HERE'
+$DomainName = 'DOMAIN-NAME-HERE'
 
 # Retrieve authentication token from Graph, convert to secure string.
 Connect-AzAccount -Identity | Out-Null
@@ -17,7 +18,7 @@ $SecureToken = ($Token.Token | ConvertTo-SecureString -AsPlainText -Force) # Con
 Connect-MgGraph -AccessToken $SecureToken -NoWelcome
 
 # Connect to Exchange Online using managed identity (permissions assigned in Entra ID with Graph API)
-Connect-ExchangeOnline -ManagedIdentity -Organization coniferllc.onmicrosoft.com
+Connect-ExchangeOnline -ManagedIdentity -Organization $DomainNAme
 
 # Retrieve list of shared mailboxes and export to csv.
 $SharedMailboxes = Get-EXORecipient -ResultSize unlimited -RecipientTypeDetails "SharedMailbox" 
